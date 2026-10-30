@@ -1,0 +1,1423 @@
+--[[ ============================================================
+     SINTONIA RP • VENICE v5.2 — KEY GATE + MENU (Discord)
+     keys em canal privado, comando por mensagem, vigia de sessao
+     menu v5.0 embutido em Principal()
+============================================================ ]]
+
+if getgenv().VeniceKeyGate then return end
+getgenv().VeniceKeyGate = true
+_G.VG = _G.VG or {}
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local HS = game:GetService("HttpService")
+local TW = game:GetService("TweenService")
+local CG = game:GetService("CoreGui")
+
+local CONFIG = {
+	WEBHOOK = "https://discord.com/api/webhooks/1565801602378371274/ukEOhLF1eKd8xYn3djbnH1-bF6yWW202YhWyBNZrsfs4TGHYDTYzbo1CFYanSC-E5G7R",
+	TOKEN = "MTU2NTc5NjQyMzkxMDU2Mzg4MQ.GseO3T.ociXORkcUtj_U_86jX-UwC4bCFoyF8U8wZEKeU",
+	CANAL = "1565492007588204675",
+	UA = "DiscordBot (https://venice.ai, 1.0)",
+	TTL = 45,
+	VIGIA = 60,
+	FIXO = true,
+	ACENTO = Color3.fromRGB(72, 140, 255),
+}
+
+local API = "https://discord.com/api/v10"
+local LP = Players.LocalPlayer
+local MOB = UIS.TouchEnabled and not UIS.KeyboardEnabled
+
+local function Req() return request or http_request or (http and http.request) or (syn and syn.request) end
+local function Exec() local o, n = pcall(identifyexecutor) return o and tostring(n) or "?" end
+
+local function HWID()
+	local ok, r = pcall(function()
+		if gethwid then return gethwid() end
+		return game:GetService("RbxAnalyticsService"):GetClientId()
+	end)
+	return ok and tostring(r) or "?"
+end
+local MEU_HWID = HWID()
+local HWID_CURTO = MEU_HWID:sub(1, 16):lower()
+
+local ARQ, CACHE = "venice_key.txt", "venice_keys_cache.json"
+local function Salvar(k) if writefile then pcall(writefile, ARQ, k) end end
+local function Ler() local ok, r = pcall(function() return isfile(ARQ) and readfile(ARQ) end) return ok and r or nil end
+
+--======================== BANCO REMOTO ========================
+local KEYS, REV, LOCKS = {}, {}, {}
+local KILL, sincronizando, ultimaSinc, erroSync = false, false, 0, nil
+
+local function Aplicar(texto)
+	local t = string.upper(texto)
+	if t:match("^%s*KILL%s*$") then KILL = true return end
+	local cmd, arg, extra = t:match("^%s*(%a+)%s+(%S+)%s*(%S*)")
+	if not cmd then return end
+	if cmd == "KEY" then
+		KEYS[arg] = true REV[arg] = nil
+	elseif cmd == "REV" then
+		REV[arg] = true
+	elseif cmd == "LIB" then
+		LOCKS[arg] = nil
+	elseif cmd == "LOCK" and extra ~= "" then
+		LOCKS[arg] = string.lower(extra)
+	end
+end
+
+local function SalvarCache()
+	if not writefile then return end
+	pcall(writefile, CACHE, HS:JSONEncode({ keys = KEYS, rev = REV, locks = LOCKS, kill = KILL }))
+end
+
+local function LerCache()
+	local ok, txt = pcall(function() return isfile(CACHE) and readfile(CACHE) end)
+	if not ok or not txt then return false end
+	local ok2, d = pcall(function() return HS:JSONDecode(txt) end)
+	if not ok2 or type(d) ~= "table" then return false end
+	KEYS, REV, LOCKS, KILL = d.keys or {}, d.rev or {}, d.locks or {}, d.kill == true
+	return true
+end
+
+local function Sincronizar()
+	if sincronizando then return end
+	sincronizando = true
+	local r = Req()
+	if not r then sincronizando = false erroSync = "sem request" return end
+
+	local novas, antes, okPagina = {}, nil, false
+	for _ = 1, 3 do
+		local url = API .. "/channels/" .. CONFIG.CANAL .. "/messages?limit=100" .. (antes and ("&before=" .. antes) or "")
+		local res, tentou = nil, 0
+		repeat
+			tentou = tentou + 1
+			local ok, r2 = pcall(r, { Url = url, Method = "GET", Headers = {
+				["Authorization"] = "Bot " .. CONFIG.TOKEN,
+				["User-Agent"] = CONFIG.UA,
+				["Accept"] = "*/*" } })
+			if ok then res = r2 end
+			if res and res.StatusCode == 429 then
+				local ok3, d = pcall(function() return HS:JSONDecode(res.Body) end)
+				task.wait((ok3 and d and tonumber(d.retry_after)) or 1.5)
+				res = nil
+			end
+		until res or tentou >= 2
+
+		if not res or not res.Body then erroSync = "offline" break end
+		if res.StatusCode == 401 then erroSync = "token invalido" break end
+		if res.StatusCode == 403 then
+			local ok3, d = pcall(function() return HS:JSONDecode(res.Body) end)
+			local code = (ok3 and d and d.code) or 0
+			erroSync = (code == 40333) and "bloqueio de rede" or "sem permissao no canal"
+			break
+		end
+		if res.StatusCode == 404 then erroSync = "canal invalido" break end
+		if res.StatusCode ~= 200 then erroSync = "HTTP " .. tostring(res.StatusCode) break end
+
+		okPagina = true
+		local ok2, lista = pcall(function() return HS:JSONDecode(res.Body) end)
+		if not ok2 or type(lista) ~= "table" or #lista == 0 then break end
+		for _, m in ipairs(lista) do
+			if m.content then novas[#novas + 1] = m.content end
+		end
+		antes = lista[#lista].id
+		if #lista < 100 then break end
+	end
+
+	if okPagina then
+		local limpo = {}
+		for i = #novas, 1, -1 do limpo[#limpo + 1] = novas[i] end
+		KEYS, REV, LOCKS, KILL = {}, {}, {}, false
+		for _, txt in ipairs(limpo) do Aplicar(txt) end
+		SalvarCache()
+		erroSync = nil
+	end
+	ultimaSinc = os.time()
+	sincronizando = false
+end
+
+--=========================== LOG =============================
+local ultimoLog = 0
+local function Log(titulo, desc, cor, campos, forcar)
+	if not forcar and os.time() - ultimoLog < 3 then return end
+	ultimoLog = os.time()
+	local r = Req() if not r then return end
+	task.spawn(function()
+		local ok, b = pcall(function()
+			return HS:JSONEncode({ username = "Venice Key", embeds = {{
+				title = titulo, description = desc, color = cor or CONFIG.ACENTO,
+				timestamp = DateTime.now():Format("%Y-%m-%dT%H:%M:%SZ"),
+				footer = { text = "Sintonia • Key System" }, fields = campos or {} }} })
+		end)
+		if not ok then return end
+		pcall(r, { Url = CONFIG.WEBHOOK, Method = "POST",
+			Headers = { ["Content-Type"] = "application/json", ["User-Agent"] = CONFIG.UA }, Body = b })
+	end)
+end
+
+--=========================== UI =============================
+local function Parente()
+	local ok, h = pcall(function() return gethui and gethui() end)
+	if ok and h then return h end
+	local ok2, cg = pcall(function() return CG end)
+	if ok2 and cg then return cg end
+	return LP:FindFirstChildOfClass("PlayerGui")
+end
+
+local function N(c, pr, par)
+	local o = Instance.new(c)
+	for k, v in pairs(pr) do if k ~= "Parent" then pcall(function() o[k] = v end) end end
+	o.Parent = par or pr.Parent
+	return o
+end
+
+local RG = N("ScreenGui", { Name = "VeniceKey_" .. math.random(1e5, 999999), ResetOnSpawn = false,
+	IgnoreGuiInset = true, DisplayOrder = 900, ZIndexBehavior = Enum.ZIndexBehavior.Sibling })
+pcall(function() RG.Parent = Parente() end)
+if not RG.Parent then RG.Parent = LP:WaitForChild("PlayerGui") end
+
+local Dim = N("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0),
+	BackgroundTransparency = 1, BorderSizePixel = 0 }, RG)
+N("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "" }, Dim)
+
+local CW, CH = MOB and 318 or 400, MOB and 262 or 276
+local Card = N("Frame", { Size = UDim2.fromOffset(CW, CH), Position = UDim2.fromScale(.5, .5),
+	AnchorPoint = Vector2.new(.5, .5), BackgroundColor3 = Color3.fromRGB(21, 22, 28), BorderSizePixel = 0,
+	Active = true }, RG)
+N("UICorner", { CornerRadius = UDim.new(0, 12) }, Card)
+N("UIStroke", { Color = CONFIG.ACENTO, Thickness = 1, Transparency = .35 }, Card)
+N("UIPadding", { PaddingTop = UDim.new(0, 14), PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16) }, Card)
+
+local Topo = N("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1 }, Card)
+N("TextLabel", { Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, Text = "Sintonia • Venice",
+	TextColor3 = Color3.fromRGB(238, 238, 243), Font = Enum.Font.GothamBold, TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left, Parent = Topo })
+N("TextLabel", { Size = UDim2.new(1, 0, 0, 12), Position = UDim2.new(0, 0, 0, 18), BackgroundTransparency = 1,
+	Text = "ACESSO RESTRITO • KEY", TextColor3 = Color3.fromRGB(128, 132, 148), Font = Enum.Font.GothamMedium,
+	TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left, Parent = Topo })
+
+N("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 0, 40),
+	BackgroundColor3 = Color3.fromRGB(45, 47, 60), BorderSizePixel = 0 }, Card)
+
+local Caixa = N("Frame", { Size = UDim2.new(1, 0, 0, 38), Position = UDim2.new(0, 0, 0, 54),
+	BackgroundColor3 = Color3.fromRGB(30, 31, 40), BorderSizePixel = 0 }, Card)
+N("UICorner", { CornerRadius = UDim.new(0, 8) }, Caixa)
+local CxStroke = N("UIStroke", { Color = Color3.fromRGB(60, 62, 80), Thickness = 1 }, Caixa)
+N("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, Caixa)
+
+local Input = N("TextBox", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "",
+	PlaceholderText = "VNC-XXXX-XXXX", PlaceholderColor3 = Color3.fromRGB(100, 102, 118),
+	TextColor3 = Color3.fromRGB(235, 235, 240), Font = Enum.Font.GothamMedium, TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, MultiLine = false }, Caixa)
+
+local Botao = N("TextButton", { Size = UDim2.new(1, 0, 0, 38), Position = UDim2.new(0, 0, 0, 102),
+	BackgroundColor3 = CONFIG.ACENTO, Text = "ATIVAR", TextColor3 = Color3.new(1, 1, 1),
+	Font = Enum.Font.GothamBold, TextSize = 13, BorderSizePixel = 0, AutoButtonColor = true }, Card)
+N("UICorner", { CornerRadius = UDim.new(0, 8) }, Botao)
+
+local Status = N("TextLabel", { Size = UDim2.new(1, 0, 0, 30), Position = UDim2.new(0, 0, 0, 146),
+	BackgroundTransparency = 1, Text = "Insira sua key para liberar o menu.",
+	TextColor3 = Color3.fromRGB(140, 143, 158), Font = Enum.Font.Gotham, TextSize = 11,
+	TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top }, Card)
+
+local Pe = N("Frame", { Size = UDim2.new(1, 0, 0, 26), Position = UDim2.new(0, 0, 1, -26),
+	BackgroundTransparency = 1 }, Card)
+N("TextLabel", { Size = UDim2.new(1, -70, 1, 0), BackgroundTransparency = 1, Text = "ID: " .. HWID_CURTO,
+	TextColor3 = Color3.fromRGB(96, 98, 114), Font = Enum.Font.Code, TextSize = 10,
+	TextXAlignment = Enum.TextXAlignment.Left, Parent = Pe })
+local Copiar = N("TextButton", { Size = UDim2.fromOffset(64, 20), Position = UDim2.new(1, -64, 0, 2),
+	BackgroundColor3 = Color3.fromRGB(38, 40, 52), Text = "copiar", TextColor3 = Color3.fromRGB(180, 183, 198),
+	Font = Enum.Font.GothamMedium, TextSize = 10, BorderSizePixel = 0 }, Pe)
+N("UICorner", { CornerRadius = UDim.new(0, 5) }, Copiar)
+
+Copiar.MouseButton1Click:Connect(function()
+	if setclipboard then
+		pcall(setclipboard, MEU_HWID)
+		Copiar.Text = "ok"
+		task.delay(1.2, function() Copiar.Text = "copiar" end)
+	end
+end)
+
+local arr, ini, pos = false, nil, nil
+Topo.InputBegan:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+		arr, ini, pos = true, i.Position, Card.Position
+	end
+end)
+UIS.InputChanged:Connect(function(i)
+	if arr and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		local m = i.Position - ini
+		Card.Position = UDim2.new(pos.X.Scale, pos.X.Offset + m.X, pos.Y.Scale, pos.Y.Offset + m.Y)
+	end
+end)
+UIS.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then arr = false end
+end)
+
+Card.Size = UDim2.fromOffset(CW, 0)
+TW:Create(Dim, TweenInfo.new(.25), { BackgroundTransparency = .45 }):Play()
+TW:Create(Card, TweenInfo.new(.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = UDim2.fromOffset(CW, CH) }):Play()
+
+--========================= CAMPOS =========================
+local function Campos(extra)
+	local c = {
+		{ name = "Player", value = LP.Name .. " (" .. LP.UserId .. ")", inline = false },
+		{ name = "HWID", value = "```" .. MEU_HWID .. "```", inline = false },
+		{ name = "Executor", value = Exec(), inline = true },
+		{ name = "Place", value = tostring(game.PlaceId), inline = true },
+	}
+	for _, f in ipairs(extra or {}) do c[#c + 1] = f end
+	return c
+end
+
+--========================= VIGIA =========================
+local MINHA_KEY, vigiando, vivo = nil, false, true
+
+local function Aviso(txt, cor)
+	local g = N("ScreenGui", { Name = "VeniceKick_" .. math.random(1e5, 999999), ResetOnSpawn = false,
+		IgnoreGuiInset = true, DisplayOrder = 999 }, Parente())
+	local f = N("Frame", { Size = UDim2.fromOffset(300, 54), Position = UDim2.new(.5, 0, 0, 44),
+		AnchorPoint = Vector2.new(.5, 0), BackgroundColor3 = Color3.fromRGB(22, 23, 30), BorderSizePixel = 0 }, g)
+	N("UICorner", { CornerRadius = UDim.new(0, 8) }, f)
+	N("UIStroke", { Color = cor or Color3.fromRGB(255, 120, 120), Thickness = 1 }, f)
+	N("TextLabel", { Size = UDim2.new(1, -20, 1, 0), Position = UDim2.new(0, 10, 0, 0), BackgroundTransparency = 1,
+		Text = txt, TextColor3 = cor or Color3.fromRGB(255, 120, 120), Font = Enum.Font.GothamBold,
+		TextSize = 12, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left }, f)
+	task.delay(9, function() pcall(function() g:Destroy() end) end)
+end
+
+local function Derrubar(motivo)
+	vivo = false
+	MINHA_KEY = nil
+	pcall(function() if _G.VMenuStop then _G.VMenuStop() end end)
+	pcall(function() if _G.VSC then _G.VSC() end end)
+	pcall(function() RG:Destroy() end)
+	for _, g in pairs(_G.VG or {}) do pcall(function() g:Destroy() end) end
+	_G.VG = {}
+	getgenv().VeniceMenuAberto = false
+	Aviso("Acesso encerrado: " .. motivo)
+	Log("SESSAO ENCERRADA", motivo, 15158332, Campos(), true)
+end
+
+local function Vigiar()
+	if vigiando or not MINHA_KEY then return end
+	vigiando = true
+	task.spawn(function()
+		while vivo and MINHA_KEY do
+			task.wait(CONFIG.VIGIA)
+			if not vivo then break end
+			Sincronizar()
+			if KILL then Derrubar("kill switch") break end
+			if REV[MINHA_KEY] then Derrubar("key revogada") break end
+			if not KEYS[MINHA_KEY] then Derrubar("key removida do canal") break end
+			local dono = LOCKS[MINHA_KEY]
+			if CONFIG.FIXO and dono and dono:sub(1, 16) ~= HWID_CURTO then
+				Derrubar("key migrada de dispositivo") break
+			end
+		end
+		vigiando = false
+	end)
+end
+
+--========================= VALIDACAO =========================
+local tentativas, bloqueado = 0, false
+
+local function Diz(txt, cor)
+	Status.Text = txt
+	Status.TextColor3 = cor or Color3.fromRGB(140, 143, 158)
+end
+
+--[[ ============================================================
+     SCRIPT PRINCIPAL (menu v5.0)
+============================================================ ]]
+local Principal = function()
+	local Players=game:GetService("Players")
+	local RS=game:GetService("RunService")
+	local UIS=game:GetService("UserInputService")
+	local LS=game:GetService("Lighting")
+	local HS=game:GetService("HttpService")
+	local TPS=game:GetService("TeleportService")
+	local CG=game:GetService("CoreGui")
+	local WS=workspace
+
+	do local n=0 while not Players.LocalPlayer and n<240 do task.wait(.25) n=n+1 end end
+	local LP=Players.LocalPlayer
+	if not LP then warn("[Venice] sem player") return end
+	local Cam=WS.CurrentCamera
+	local Mouse=nil
+	pcall(function() Mouse=LP:GetMouse() end)
+	local MOB=UIS.TouchEnabled and not UIS.KeyboardEnabled
+
+	pcall(function() if _G.VMenuStop then _G.VMenuStop() end end)
+	for _,g in pairs(_G.VG or {}) do pcall(function() g:Destroy() end) end
+	pcall(function() if _G.VK then _G.VK:Destroy() end end)
+	_G.VG=nil _G.VK=nil _G.VSF=nil _G.VSC=nil _G.VAlvo=nil
+	getgenv().VeniceMenuAberto=false
+
+	--==================== WEBHOOK ====================
+	local WEBHOOK="https://discord.com/api/webhooks/1565160928230776864/NvtvBQ1soT9FXiAQDZj9FBf-9dcj7TlCROxbxJTeYf4KDH7m0k2TsisN3hTUBD5ZSrf1"
+
+	local function Req() return request or http_request or (http and http.request) or (syn and syn.request) end
+	local function Exec() local o,n=pcall(identifyexecutor) return o and tostring(n) or "?" end
+
+	local function Enviar(alvo,pay,tent)
+		local r=Req() if not r then return false,0 end
+		local ok,b=pcall(function() return HS:JSONEncode(pay) end)
+		if not ok then return false,0 end
+		local ult=0
+		for _=1,(tent or 3) do
+			local o2,res=pcall(r,{Url=alvo,Method="POST",Headers={["Content-Type"]="application/json",
+				["User-Agent"]="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},Body=b})
+			if o2 and res then
+				ult=tonumber(res.StatusCode) or 0
+				if ult==200 or ult==204 then return true,ult end
+				if ult==401 or ult==404 then return false,ult end
+				if ult==429 then task.wait(2.5) end
+			end
+			task.wait(1)
+		end
+		return false,ult
+	end
+	local function Raw(a,p) task.spawn(function() Enviar(a,p,3) end) end
+
+	local function Hook(t,d,c,f)
+		Raw(WEBHOOK,{username="Venice Menu",embeds={{title=t,description=d,color=c or 5793266,
+			timestamp=DateTime.now():Format("%Y-%m-%dT%H:%M:%SZ"),footer={text="Venice • Sintonia RP"},fields=f or {}}}})
+	end
+
+	local function Campos()
+		return {{name="Player",value=LP.Name,inline=true},{name="UserID",value=tostring(LP.UserId),inline=true},
+			{name="Executor",value=Exec(),inline=true},{name="Place",value=tostring(game.PlaceId),inline=false}}
+	end
+
+	--==================== CONFIG ====================
+	local Cfg={
+		ESP={On=true,Box=true,Nome=true,Dist=true,HP=true,Trace=false,Sk=false,Time=true,Staff=true,Max=900,
+			Cor=Color3.fromRGB(0,255,140),CorStaff=Color3.fromRGB(180,0,255)},
+		Aim={On=true,Modo="Camera",Parte="Head",FOV=110,Smooth=.25,Pred=true,PredQ=.12,Time=true,Wall=true,
+			Trig=true,Dist=40,Circ=true,Sticky=true},
+		Mov={Speed=false,Vel=24,Seguro=true,Jump=false,JP=60,Inf=false,Fly=false,FlyModo="Stealth",FlyVel=60,
+			FlyClip=true,Clip=false,Freeze=false,Fling=true,Void=true,Alt=6,Forca=900},
+		Farm={Click=false,Delay=.1,Coleta=false,RColeta=70,Resp=false,Aviso=true,AutoDrop=true,RDrop=90},
+		Misc={AFK=true,Full=false,Lag=false},
+	}
+
+	--==================== UTIL ====================
+	local function N(c,pr,par)
+		local o=Instance.new(c)
+		for k,v in pairs(pr) do if k~="Parent" then pcall(function() o[k]=v end) end end
+		o.Parent=par or pr.Parent
+		return o
+	end
+
+	local PCache=nil
+	local function Probe(p)
+		if not p then return false end
+		local s=Instance.new("ScreenGui")
+		local ok=pcall(function() s.Parent=p end)
+		local g=ok and s.Parent==p
+		pcall(function() s:Destroy() end)
+		return g
+	end
+	local function Parente()
+		if PCache and Probe(PCache) then return PCache end
+		local c={}
+		local ok,h=pcall(function() return gethui and gethui() end)
+		if ok and h then c[#c+1]=h end
+		c[#c+1]=CG
+		local pg=LP:FindFirstChildOfClass("PlayerGui")
+		if pg then c[#c+1]=pg end
+		for _,p in ipairs(c) do if Probe(p) then PCache=p return p end end
+		PCache=pg or CG
+		return PCache
+	end
+	local function Gui(n,o)
+		local s=Instance.new("ScreenGui")
+		s.Name=n s.ResetOnSpawn=false s.IgnoreGuiInset=true s.DisplayOrder=o or 50
+		s.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+		local p=Parente()
+		pcall(function() s.Parent=p end)
+		if s.Parent~=p then
+			local pg=LP:FindFirstChildOfClass("PlayerGui")
+			if pg then pcall(function() s.Parent=pg end) end
+		end
+		return s
+	end
+
+	local function Char()
+		local c=LP.Character
+		if not c then return nil,nil,nil end
+		return c,c:FindFirstChildOfClass("Humanoid"),c:FindFirstChild("HumanoidRootPart")
+	end
+
+	local STAFF={"staff","admin","adm","mod","dono","diretor","owner","dev","equipe","suporte","gerente"}
+	local function Tem(s)
+		s=string.lower(tostring(s or ""))
+		for _,w in ipairs(STAFF) do if string.find(s,w,1,true) then return true end end
+		return false
+	end
+	local function EhStaff(p)
+		if not p then return false end
+		if p.Team and Tem(p.Team.Name) then return true end
+		for _,o in ipairs({p,p.Character}) do
+			if o then
+				for _,n in ipairs({"Team","Cargo","Job","Role","Staff","Rank"}) do
+					local v=o:FindFirstChild(n)
+					if v and (v:IsA("StringValue") or v:IsA("IntValue")) and Tem(v.Value) then return true end
+					local a=o:GetAttribute(n)
+					if a and Tem(a) then return true end
+				end
+			end
+		end
+		return false
+	end
+	local StaffC={}
+	task.spawn(function() while task.wait(3) do
+		for _,p in ipairs(Players:GetPlayers()) do pcall(function() StaffC[p]=EhStaff(p) end) end
+	end end)
+
+	local function Time(p)
+		if p.Team and LP.Team and p.Team==LP.Team then return true end
+		if p.TeamColor and LP.TeamColor and p.TeamColor==LP.TeamColor then return true end
+		return false
+	end
+
+	--==================== TOAST ====================
+	local TG=Gui("VT_"..math.random(1e5,999999),200)
+	local TH=N("Frame",{Size=UDim2.new(0,280,0,0),Position=UDim2.new(.5,0,0,10),AnchorPoint=Vector2.new(.5,0),
+		BackgroundTransparency=1,AutomaticSize=Enum.AutomaticSize.Y},TG)
+	N("UIListLayout",{Padding=UDim.new(0,5),HorizontalAlignment=Enum.HorizontalAlignment.Center},TH)
+
+	local function Toast(t,txt,dur,cor)
+		local g=N("Frame",{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,
+			BackgroundColor3=Color3.fromRGB(22,23,30),BorderSizePixel=0},TH)
+		N("UICorner",{CornerRadius=UDim.new(0,8)},g)
+		N("UIStroke",{Color=cor or Color3.fromRGB(70,140,255),Thickness=1},g)
+		N("UIPadding",{PaddingTop=UDim.new(0,6),PaddingBottom=UDim.new(0,6),
+			PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8)},g)
+		local c=N("Frame",{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1},g)
+		N("UIListLayout",{Padding=UDim.new(0,2)},c)
+		N("TextLabel",{Size=UDim2.new(1,0,0,15),BackgroundTransparency=1,Text=t,TextColor3=cor or Color3.fromRGB(120,200,255),
+			Font=Enum.Font.GothamBold,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,Parent=c})
+		N("TextLabel",{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1,Text=tostring(txt),
+			TextColor3=Color3.fromRGB(225,225,230),Font=Enum.Font.Gotham,TextSize=11,TextWrapped=true,
+			TextXAlignment=Enum.TextXAlignment.Left,Parent=c})
+		task.delay(dur or 6,function() pcall(function() g:Destroy() end) end)
+	end
+
+	--==================== TELEPORTE ====================
+	local TP={CF=nil,Ate=0,Anc=false}
+	function Teleport(cf,hold)
+		local _,_,h=Char() if not h then return end
+		pcall(function() h:SetNetworkOwner(LP) end)
+		if Cfg.Mov.Seguro then h.Anchored=true end
+		h.CFrame=cf TP.CF=cf TP.Ate=tick()+(hold or .7) TP.Anc=Cfg.Mov.Seguro
+	end
+
+	local Mont=false
+
+	--=====================================================================
+	--  CASCA
+	--=====================================================================
+	local function Casca()
+		local RG=Gui("Menu_"..math.random(1e5,999999),60)
+		local S={RG=RG}
+
+		local Main=N("Frame",{Size=MOB and UDim2.fromOffset(330,285) or UDim2.fromOffset(440,340),
+			Position=UDim2.new(0,18,0,60),BackgroundColor3=Color3.fromRGB(21,22,28),BorderSizePixel=0,Active=true},RG)
+		N("UICorner",{CornerRadius=UDim.new(0,10)},Main)
+		N("UIStroke",{Color=Color3.fromRGB(60,62,80),Thickness=1},Main)
+		S.Main=Main
+
+		local Bar=N("Frame",{Size=UDim2.new(1,0,0,30),BackgroundColor3=Color3.fromRGB(29,30,39),BorderSizePixel=0},Main)
+		N("UICorner",{CornerRadius=UDim.new(0,10)},Bar)
+		N("TextLabel",{Size=UDim2.new(1,-80,1,0),Position=UDim2.new(0,10,0,0),BackgroundTransparency=1,
+			Text="Sintonia • Venice",TextColor3=Color3.fromRGB(235,235,240),
+			Font=Enum.Font.GothamBold,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,Parent=Bar})
+
+		local Min=N("TextButton",{Size=UDim2.new(0,24,0,22),Position=UDim2.new(1,-30,0,4),
+			BackgroundColor3=Color3.fromRGB(45,47,60),Text="-",TextColor3=Color3.new(1,1,1),
+			Font=Enum.Font.GothamBold,TextSize=15,BorderSizePixel=0},Bar)
+		N("UICorner",{CornerRadius=UDim.new(0,6)},Min)
+
+		local Float=N("TextButton",{Size=UDim2.fromOffset(46,46),Position=UDim2.new(0,16,0,60),
+			BackgroundColor3=Color3.fromRGB(35,90,190),Text="S",TextColor3=Color3.new(1,1,1),
+			Font=Enum.Font.GothamBold,TextSize=18,BorderSizePixel=0,Visible=false},RG)
+		N("UICorner",{CornerRadius=UDim.new(1,0)},Float)
+		S.Float=Float
+
+		Min.MouseButton1Click:Connect(function() Main.Visible=false Float.Visible=true end)
+		Float.MouseButton1Click:Connect(function() Main.Visible=true Float.Visible=false end)
+		UIS.InputBegan:Connect(function(i,g)
+			if not g and i.KeyCode==Enum.KeyCode.RightControl then
+				Main.Visible=not Main.Visible Float.Visible=not Main.Visible end
+		end)
+
+		local d,st,sp=false,nil,nil
+		Bar.InputBegan:Connect(function(i)
+			if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+				d,st,sp=true,i.Position,Main.Position end
+		end)
+		UIS.InputChanged:Connect(function(i)
+			if d and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+				local m=i.Position-st
+				Main.Position=UDim2.new(sp.X.Scale,sp.X.Offset+m.X,sp.Y.Scale,sp.Y.Offset+m.Y) end
+		end)
+		UIS.InputEnded:Connect(function(i)
+			if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then d=false end
+		end)
+
+		local TB=N("ScrollingFrame",{Size=UDim2.new(0,90,1,-40),Position=UDim2.new(0,6,0,34),BackgroundTransparency=1,
+			BorderSizePixel=0,ScrollBarThickness=2,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y},Main)
+		N("UIListLayout",{Padding=UDim.new(0,5)},TB)
+		local CT=N("Frame",{Size=UDim2.new(1,-104,1,-40),Position=UDim2.new(0,100,0,34),BackgroundTransparency=1},Main)
+		S.CT=CT
+
+		local Pages={}
+		S.Tab=function(nome)
+			local b=N("TextButton",{Size=UDim2.new(1,0,0,26),BackgroundColor3=Color3.fromRGB(30,31,40),Text=nome,
+				TextColor3=Color3.fromRGB(200,200,210),Font=Enum.Font.GothamMedium,TextSize=12,BorderSizePixel=0},TB)
+			N("UICorner",{CornerRadius=UDim.new(0,6)},b)
+			local pg=N("ScrollingFrame",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,BorderSizePixel=0,
+				ScrollBarThickness=3,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y,Visible=false},CT)
+			N("UIListLayout",{Padding=UDim.new(0,5)},pg)
+			N("UIPadding",{PaddingRight=UDim.new(0,6),PaddingBottom=UDim.new(0,8)},pg)
+			local t={}
+			local function Sel()
+				for _,p in pairs(Pages) do p.Visible=false end
+				pg.Visible=true
+				for _,x in pairs(TB:GetChildren()) do
+					if x:IsA("TextButton") then x.BackgroundColor3=Color3.fromRGB(30,31,40) end end
+				b.BackgroundColor3=Color3.fromRGB(45,85,160)
+			end
+			b.MouseButton1Click:Connect(Sel)
+			Pages[#Pages+1]=pg
+			local n=0
+			local function Linha(txt,h)
+				n=n+1
+				local r=N("TextButton",{Size=UDim2.new(1,0,0,h or 30),BackgroundColor3=Color3.fromRGB(31,32,41),
+					Text="",AutoButtonColor=false,BorderSizePixel=0,LayoutOrder=n},pg)
+				N("UICorner",{CornerRadius=UDim.new(0,6)},r)
+				local lb=N("TextLabel",{Size=UDim2.new(.55,0,1,0),Position=UDim2.new(0,10,0,0),BackgroundTransparency=1,
+					Text=txt,TextColor3=Color3.fromRGB(225,225,232),Font=Enum.Font.GothamMedium,TextSize=12,
+					TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,Parent=r})
+				local v=N("TextLabel",{Size=UDim2.new(.4,0,1,0),Position=UDim2.new(.55,-6,0,0),BackgroundTransparency=1,
+					Text="",TextColor3=Color3.fromRGB(120,200,255),Font=Enum.Font.GothamBold,TextSize=12,
+					TextXAlignment=Enum.TextXAlignment.Right,Parent=r})
+				return r,lb,v
+			end
+			t.Tog=function(txt,def,cb)
+				local r,_,v=Linha(txt)
+				local s=def and true or false
+				local function rf()
+					v.Text=s and "ON" or "OFF"
+					v.TextColor3=s and Color3.fromRGB(90,230,140) or Color3.fromRGB(150,150,160)
+					r.BackgroundColor3=s and Color3.fromRGB(34,48,40) or Color3.fromRGB(31,32,41)
+				end
+				r.MouseButton1Click:Connect(function() s=not s rf() task.spawn(function() pcall(cb,s) end) end)
+				rf()
+			end
+			t.Sli=function(txt,def,mn,mx,st,cb)
+				local r,_,v=Linha(txt)
+				v.Size=UDim2.new(.22,0,1,0) v.Position=UDim2.new(.36,0,0,0)
+				local c=def
+				local function sv(x)
+					c=math.clamp(x,mn,mx)
+					if st and st>0 then c=math.floor(c/st+.5)*st end
+					v.Text=tostring(c)
+					task.spawn(function() pcall(cb,c) end)
+				end
+				local mi=N("TextButton",{Size=UDim2.new(0,24,0,24),Position=UDim2.new(1,-56,0,3),
+					BackgroundColor3=Color3.fromRGB(45,47,60),Text="-",TextColor3=Color3.new(1,1,1),
+					Font=Enum.Font.GothamBold,TextSize=15,BorderSizePixel=0,Parent=r})
+				N("UICorner",{CornerRadius=UDim.new(0,6)},mi)
+				local pl=N("TextButton",{Size=UDim2.new(0,24,0,24),Position=UDim2.new(1,-28,0,3),
+					BackgroundColor3=Color3.fromRGB(45,47,60),Text="+",TextColor3=Color3.new(1,1,1),
+					Font=Enum.Font.GothamBold,TextSize=15,BorderSizePixel=0,Parent=r})
+				N("UICorner",{CornerRadius=UDim.new(0,6)},pl)
+				mi.MouseButton1Click:Connect(function() sv(c-(st or 1)) end)
+				pl.MouseButton1Click:Connect(function() sv(c+(st or 1)) end)
+				v.Text=tostring(c)
+			end
+			t.Drop=function(txt,vals,def,cb)
+				local r,_,v=Linha(txt)
+				local i=1
+				for j,x in ipairs(vals) do if x==def then i=j end end
+				local function rf() v.Text=tostring(vals[i]) end
+				r.MouseButton1Click:Connect(function()
+					i=i+1 if i>#vals then i=1 end rf() task.spawn(function() pcall(cb,vals[i]) end)
+				end)
+				rf()
+			end
+			t.Btn=function(txt,cb)
+				local r,lb,v=Linha(txt)
+				v.Text="" lb.Size=UDim2.new(1,-20,1,0) lb.TextXAlignment=Enum.TextXAlignment.Center
+				r.MouseButton1Click:Connect(function() task.spawn(function() pcall(cb) end) end)
+			end
+			t.Lbl=function(txt)
+				n=n+1
+				N("TextLabel",{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1,
+					Text=txt,TextColor3=Color3.fromRGB(150,152,165),Font=Enum.Font.Gotham,TextSize=11,
+					TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,LayoutOrder=n},pg)
+			end
+			t.Sel=Sel
+			return t
+		end
+		return S
+	end
+
+	--=====================================================================
+	--  MODULOS
+	--=====================================================================
+	local function Modulos(S)
+		local Falhas={}
+		local function Try(n,f)
+			local ok,e=pcall(f)
+			if not ok then Falhas[#Falhas+1]=n warn("[Venice] "..n..": "..tostring(e)) end
+		end
+
+		local Tab=S.Tab
+		local ESPObj,Drops={},{}
+		local UpESP,RefESP,DelESP,DelDrop
+		local StopFly,Soltar,Prender,Jogar
+		local RefPonto,Mirar
+		local flyC,flyA
+		local MUp,MDown=false,false
+		local BU,BD
+		local Car={M=nil,P={},A={},Presa=false}
+		local EG=Gui("S_"..math.random(1e5,999999),4)
+		local TCG=Gui("ST_"..math.random(1e5,999999),5)
+		_G.VG={S.RG,EG,TCG,TG}
+
+		local TSis,TVis,TAim,TPlr,TCar,TFarm,TCfg=
+			Tab("Sistema"),Tab("Visual"),Tab("Mira"),Tab("Player"),Tab("Carro"),Tab("Farm"),Tab("Config")
+
+		-- SISTEMA
+		TSis.Btn("DIAGNOSTICO",function()
+			Toast("Diag",("exec:%s | req:%s | falhas:%d | players:%d"):format(
+				Exec(),tostring(Req()~=nil),#Falhas,#Players:GetPlayers()),14)
+		end)
+		TSis.Btn("PANIC MODE",function()
+			Cfg.Mov.Fly=false Cfg.Mov.Freeze=false Cfg.Mov.Clip=false
+			if StopFly then pcall(StopFly) end
+			if Soltar then pcall(Soltar) end
+			local _,_,h=Char() if h then h.Anchored=false end
+			Toast("PANIC","Tudo liberado.",8,Color3.fromRGB(255,180,90))
+		end)
+		TSis.Tog("Anti-AFK",true,function(v) Cfg.Misc.AFK=v end)
+		TSis.Tog("Fullbright",false,function(v)
+			Cfg.Misc.Full=v
+			if not v then pcall(function()
+				LS.Brightness=2 LS.ClockTime=14 LS.Ambient=Color3.fromRGB(70,70,70)
+				LS.OutdoorAmbient=Color3.fromRGB(128,128,128) LS.FogEnd=1e5
+			end) end
+		end)
+		TSis.Tog("Anti-Lag",false,function(v)
+			if v then pcall(function()
+				settings().Rendering.QualityLevel=Enum.QualityLevel.Level01
+				LS.GlobalShadows=false LS.FogEnd=9e9
+			end) end
+		end)
+
+		-- VISUAL
+		TVis.Tog("ESP",true,function(v) Cfg.ESP.On=v if v and RefESP then pcall(RefESP) end end)
+		TVis.Tog("Caixas",true,function(v) Cfg.ESP.Box=v end)
+		TVis.Tog("Nomes",true,function(v) Cfg.ESP.Nome=v end)
+		TVis.Tog("Distancia",true,function(v) Cfg.ESP.Dist=v end)
+		TVis.Tog("Vida",true,function(v) Cfg.ESP.HP=v end)
+		TVis.Tog("Esqueleto",false,function(v) Cfg.ESP.Sk=v end)
+		TVis.Tog("Tracers",false,function(v) Cfg.ESP.Trace=v end)
+		TVis.Tog("Cor do time",true,function(v) Cfg.ESP.Time=v end)
+		TVis.Tog("Destacar STAFF",true,function(v) Cfg.ESP.Staff=v end)
+		TVis.Sli("Distancia max",900,100,3000,50,function(v) Cfg.ESP.Max=v end)
+
+		-- MIRA
+		TAim.Tog("AIMBOT",true,function(v) Cfg.Aim.On=v end)
+		TAim.Drop("Modo",{"Camera","Mouse","Silent"},"Camera",function(v) Cfg.Aim.Modo=v end)
+		TAim.Drop("Parte",{"Head","UpperTorso","HumanoidRootPart"},"Head",function(v) Cfg.Aim.Parte=v end)
+		TAim.Sli("FOV",110,30,400,5,function(v) Cfg.Aim.FOV=v end)
+		TAim.Sli("Suavidade",.25,.05,.6,.05,function(v) Cfg.Aim.Smooth=v end)
+		TAim.Tog("Prediction",true,function(v) Cfg.Aim.Pred=v end)
+		TAim.Sli("Forca pred",.12,.02,.4,.01,function(v) Cfg.Aim.PredQ=v end)
+		TAim.Tog("Triggerbot",true,function(v) Cfg.Aim.Trig=v end)
+		TAim.Sli("Dist. gatilho",40,8,120,2,function(v) Cfg.Aim.Dist=v end)
+		TAim.Tog("Sticky",true,function(v) Cfg.Aim.Sticky=v end)
+		TAim.Tog("Team check",true,function(v) Cfg.Aim.Time=v end)
+		TAim.Tog("Wall check",true,function(v) Cfg.Aim.Wall=v end)
+		TAim.Tog("Circulo FOV",true,function(v) Cfg.Aim.Circ=v end)
+
+		-- PLAYER
+		TPlr.Tog("Speed",false,function(v) Cfg.Mov.Speed=v end)
+		TPlr.Sli("Velocidade",24,16,120,1,function(v) Cfg.Mov.Vel=v end)
+		TPlr.Tog("Jump power",false,function(v) Cfg.Mov.Jump=v end)
+		TPlr.Sli("Pulo",60,50,250,5,function(v) Cfg.Mov.JP=v end)
+		TPlr.Tog("Pulo infinito",false,function(v) Cfg.Mov.Inf=v end)
+		TPlr.Tog("Fly",false,function(v) Cfg.Mov.Fly=v end)
+		TPlr.Drop("Modo fly",{"Stealth","Fisica"},"Stealth",function(v) Cfg.Mov.FlyModo=v end)
+		TPlr.Sli("Vel. voo",60,20,300,5,function(v) Cfg.Mov.FlyVel=v end)
+		TPlr.Tog("Noclip voando",true,function(v) Cfg.Mov.FlyClip=v end)
+		TPlr.Tog("Noclip",false,function(v) Cfg.Mov.Clip=v end)
+		TPlr.Tog("Congelar",false,function(v) Cfg.Mov.Freeze=v end)
+		TPlr.Tog("Anti-Fling",true,function(v) Cfg.Mov.Fling=v end)
+		TPlr.Tog("Anti-Void",true,function(v) Cfg.Mov.Void=v end)
+		TPlr.Tog("TP seguro",true,function(v) Cfg.Mov.Seguro=v end)
+		TPlr.Btn("TP centro da mira",function()
+			local ray=Cam:ViewportPointToRay(Cam.ViewportSize.X/2,Cam.ViewportSize.Y/2)
+			local p=RaycastParams.new() p.FilterDescendantsInstances={LP.Character}
+			local hit=WS:Raycast(ray.Origin,ray.Direction*3000,p)
+			if hit then Teleport(CFrame.new(hit.Position+Vector3.new(0,4,0)),.8) end
+		end)
+		TPlr.Btn("TP em player (cicla)",function()
+			local l={} for _,p in ipairs(Players:GetPlayers()) do if p~=LP and p.Character then l[#l+1]=p end end
+			if #l==0 then return end
+			TPlr._i=(TPlr._i or 0)+1 if TPlr._i>#l then TPlr._i=1 end
+			Teleport(l[TPlr._i].Character:GetPivot()*CFrame.new(0,0,3),1.2)
+		end)
+
+		-- CARRO
+		TCar.Lbl("Pega o veiculo mais proximo e sobe ele na sua cabeca.")
+		TCar.Btn("PEGAR / SOLTAR",function() if Prender then Prender() end end)
+		TCar.Btn("ARREMESSAR",function() if Jogar then Jogar() end end)
+		TCar.Btn("Soltar no chao",function() if Soltar then Soltar() end end)
+		TCar.Sli("Altura",6,3,40,1,function(v) Cfg.Mov.Alt=v end)
+		TCar.Sli("Forca",900,100,4000,50,function(v) Cfg.Mov.Forca=v end)
+
+		-- FARM
+		TFarm.Tog("Auto click",false,function(v) Cfg.Farm.Click=v end)
+		TFarm.Sli("Delay",.1,.03,1,.01,function(v) Cfg.Farm.Delay=v end)
+		TFarm.Tog("Avisar drops",true,function(v) Cfg.Farm.Aviso=v end)
+		TFarm.Tog("Auto drop",true,function(v) Cfg.Farm.AutoDrop=v end)
+		TFarm.Sli("Alcance drop",90,10,500,10,function(v) Cfg.Farm.RDrop=v end)
+		TFarm.Tog("Auto coletar",false,function(v) Cfg.Farm.Coleta=v end)
+		TFarm.Sli("Alcance coleta",70,10,300,5,function(v) Cfg.Farm.RColeta=v end)
+		TFarm.Tog("Auto respawn",false,function(v) Cfg.Farm.Resp=v end)
+		TFarm.Btn("Reentrar",function() pcall(function() TPS:Teleport(game.PlaceId,LP) end) end)
+
+		-- CONFIG
+		TCfg.Btn("TESTAR WEBHOOK",function()
+			task.spawn(function()
+				local ok,cd=Enviar(WEBHOOK,{username="Venice",embeds={{title="TESTE",description="manual",
+					color=5763719,timestamp=DateTime.now():Format("%Y-%m-%dT%H:%M:%SZ"),fields=Campos()}}},3)
+				Toast(ok and "Webhook OK" or "Webhook falhou",ok and ("status "..tostring(cd)) or
+					("status "..tostring(cd).." (401/404=url, 0=sem request)"),10,
+					ok and Color3.fromRGB(110,230,150) or Color3.fromRGB(255,110,110))
+			end)
+		end)
+		TCfg.Btn("DESTRUIR",function()
+			if StopFly then pcall(StopFly) end
+			if Soltar then pcall(Soltar) end
+			if DelESP then for p in pairs(ESPObj) do DelESP(p) end end
+			if DelDrop then for p in pairs(Drops) do DelDrop(p) end end
+			for _,g in pairs(_G.VG or {}) do pcall(function() g:Destroy() end) end
+			Hook("SCRIPT FECHADO","menu destruido",10038562,Campos())
+			getgenv().VeniceMenuAberto=false Mont=false
+		end)
+
+		TSis.Sel()
+
+		--==================== ESP ====================
+		Try("ESP",function()
+			local R15={{"Head","UpperTorso"},{"UpperTorso","LowerTorso"},
+				{"UpperTorso","LeftUpperArm"},{"LeftUpperArm","LeftLowerArm"},{"LeftLowerArm","LeftHand"},
+				{"UpperTorso","RightUpperArm"},{"RightUpperArm","RightLowerArm"},{"RightLowerArm","RightHand"},
+				{"LowerTorso","LeftUpperLeg"},{"LeftUpperLeg","LeftLowerLeg"},{"LeftLowerLeg","LeftFoot"},
+				{"LowerTorso","RightUpperLeg"},{"RightUpperLeg","RightLowerLeg"},{"RightLowerLeg","RightFoot"}}
+			local R6={{"Head","Torso"},{"Torso","Left Arm"},{"Torso","Right Arm"},{"Torso","Left Leg"},{"Torso","Right Leg"}}
+			local function NF(c,pr)
+				local f=N(c,pr,EG) f.BorderSizePixel=0 f.Visible=false return f
+			end
+			local function Criar(p)
+				if p==LP or ESPObj[p] then return end
+				local d={L={}}
+				for i=1,#R15 do d.L[i]=NF("Frame",{AnchorPoint=Vector2.new(.5,.5),
+					BackgroundColor3=Cfg.ESP.Cor,Size=UDim2.fromOffset(1,1),ZIndex=2}) end
+				d.B=NF("Frame",{BackgroundTransparency=.85,BackgroundColor3=Cfg.ESP.Cor,ZIndex=1})
+				d.S=N("UIStroke",{Thickness=1.3},d.B)
+				d.N=NF("TextLabel",{Size=UDim2.fromOffset(220,18),BackgroundTransparency=1,TextColor3=Color3.new(1,1,1),
+					TextStrokeTransparency=.25,Font=Enum.Font.GothamBold,TextSize=13,ZIndex=3})
+				d.I=NF("TextLabel",{Size=UDim2.fromOffset(220,16),BackgroundTransparency=1,
+					TextColor3=Color3.fromRGB(215,215,215),TextStrokeTransparency=.35,Font=Enum.Font.Gotham,TextSize=11,ZIndex=3})
+				d.H=NF("Frame",{AnchorPoint=Vector2.new(1,1),BackgroundColor3=Color3.fromRGB(0,255,80),ZIndex=3})
+				d.T=NF("Frame",{AnchorPoint=Vector2.new(0,.5),BackgroundColor3=Cfg.ESP.Cor,ZIndex=1})
+				ESPObj[p]=d
+			end
+			local function Ocultar(d)
+				for _,l in ipairs(d.L) do l.Visible=false end
+				d.B.Visible=false d.N.Visible=false d.I.Visible=false d.H.Visible=false d.T.Visible=false
+			end
+			DelESP=function(p)
+				local d=ESPObj[p] if not d then return end
+				for _,l in ipairs(d.L) do pcall(function() l:Destroy() end) end
+				for _,o in ipairs({d.B,d.N,d.I,d.H,d.T}) do pcall(function() o:Destroy() end) end
+				ESPObj[p]=nil
+			end
+			UpESP=function()
+				if not Cfg.ESP.On then for _,d in pairs(ESPObj) do Ocultar(d) end return end
+				for p,d in pairs(ESPObj) do
+					local ch=p.Character
+					local hm=ch and ch:FindFirstChildOfClass("Humanoid")
+					local rt=ch and (ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChild("UpperTorso"))
+					if not ch or not hm or not rt or hm.Health<=0 then Ocultar(d) continue end
+					local ds=(rt.Position-Cam.CFrame.Position).Magnitude
+					if ds>Cfg.ESP.Max then Ocultar(d) continue end
+					local co=Cfg.ESP.Cor
+					if Cfg.ESP.Time and p.Team then co=p.Team.TeamColor.Color end
+					if Cfg.ESP.Staff and StaffC[p] then co=Cfg.ESP.CorStaff end
+					local cf,sz=ch:GetBoundingBox()
+					local tp=Cam:WorldToViewportPoint(cf.Position+Vector3.new(0,sz.Y/2,0))
+					local bt=Cam:WorldToViewportPoint(cf.Position-Vector3.new(0,sz.Y/2,0))
+					if tp.Z>0 and bt.Z>0 then
+						local h=math.abs(bt.Y-tp.Y) local w=h*.58
+						local cx,cy=(tp.X+bt.X)/2,(tp.Y+bt.Y)/2
+						d.B.Size=UDim2.fromOffset(w,h) d.B.Position=UDim2.fromOffset(cx,cy)
+						d.B.AnchorPoint=Vector2.new(.5,.5) d.B.BackgroundColor3=co d.S.Color=co
+						d.B.Visible=Cfg.ESP.Box
+						d.N.Text=p.Name..(StaffC[p] and " [STAFF]" or "") d.N.TextColor3=co
+						d.N.Position=UDim2.fromOffset(cx,cy-h/2-14) d.N.AnchorPoint=Vector2.new(.5,.5)
+						d.N.Visible=Cfg.ESP.Nome
+						local tx=""
+						if Cfg.ESP.HP then tx="HP: "..math.floor(hm.Health) end
+						if Cfg.ESP.Dist then tx=tx..(tx~="" and " | " or "")..math.floor(ds).."m" end
+						d.I.Text=tx d.I.Position=UDim2.fromOffset(cx,cy+h/2+10) d.I.AnchorPoint=Vector2.new(.5,.5)
+						d.I.Visible=tx~=""
+						if Cfg.ESP.HP then
+							local fr=math.clamp(hm.Health/math.max(hm.MaxHealth,1),0,1)
+							d.H.Size=UDim2.fromOffset(3,h*fr) d.H.Position=UDim2.fromOffset(cx-w/2-4,cy+h/2)
+							d.H.BackgroundColor3=Color3.fromRGB(255,60,60):Lerp(Color3.fromRGB(0,255,90),fr)
+							d.H.Visible=true
+						else d.H.Visible=false end
+						if Cfg.ESP.Trace then
+							local vp=Cam.ViewportSize
+							local a=Vector2.new(vp.X/2,vp.Y) local b2=Vector2.new(cx,cy+h/2)
+							local df=b2-a
+							d.T.Position=UDim2.fromOffset(a.X,a.Y) d.T.Size=UDim2.fromOffset(df.Magnitude,1)
+							d.T.Rotation=math.deg(math.atan2(df.Y,df.X)) d.T.BackgroundColor3=co d.T.Visible=true
+						else d.T.Visible=false end
+					else Ocultar(d) end
+					if Cfg.ESP.Sk then
+						local ls=ch:FindFirstChild("UpperTorso") and R15 or R6
+						for i=1,#R15 do
+							local ln,bn=d.L[i],ls[i]
+							if not bn then ln.Visible=false continue end
+							local a,b3=ch:FindFirstChild(bn[1]),ch:FindFirstChild(bn[2])
+							if a and b3 then
+								local p1,o1=Cam:WorldToViewportPoint(a.Position)
+								local p2,o2=Cam:WorldToViewportPoint(b3.Position)
+								if o1 and o2 and p1.Z>0 and p2.Z>0 then
+									local v1,v2=Vector2.new(p1.X,p1.Y),Vector2.new(p2.X,p2.Y)
+									local md,df=(v1+v2)/2,v2-v1
+									ln.Position=UDim2.fromOffset(md.X,md.Y) ln.Size=UDim2.fromOffset(df.Magnitude,1.6)
+									ln.Rotation=math.deg(math.atan2(df.Y,df.X)) ln.BackgroundColor3=co ln.Visible=true
+								else ln.Visible=false end
+							else ln.Visible=false end
+						end
+					else for _,l in ipairs(d.L) do l.Visible=false end end
+				end
+			end
+			RefESP=function() for _,p in ipairs(Players:GetPlayers()) do if p~=LP then Criar(p) end end end
+			Players.PlayerAdded:Connect(function(p)
+				p.CharacterAdded:Connect(function() task.wait(.4) Criar(p) end)
+				if p.Character then task.delay(.4,Criar,p) end
+			end)
+			Players.PlayerRemoving:Connect(function(p) DelESP(p) StaffC[p]=nil end)
+			RefESP()
+		end)
+
+		--==================== MIRA ====================
+		Try("Mira",function()
+			local Sticky=nil
+			local function Pred(pt)
+				if not pt then return Vector3.zero end
+				if not Cfg.Aim.Pred then return pt.Position end
+				return pt.Position+(pt.AssemblyLinearVelocity or Vector3.zero)*Cfg.Aim.PredQ
+			end
+			local function Parede(pos,ch)
+				local p=RaycastParams.new()
+				p.FilterType=Enum.RaycastFilterType.Exclude
+				p.FilterDescendantsInstances={LP.Character,ch}
+				return WS:Raycast(Cam.CFrame.Position,pos-Cam.CFrame.Position,p)~=nil
+			end
+			RefPonto=function()
+				if Cfg.Aim.Modo=="Camera" or MOB then return Cam.ViewportSize/2 end
+				return Vector2.new(Mouse and Mouse.X or 0,Mouse and Mouse.Y or 0)
+			end
+			Mirar=function(pt)
+				if not pt then return end
+				local pos=Pred(pt)
+				if Cfg.Aim.Modo=="Silent" then return end
+				if Cfg.Aim.Modo=="Mouse" and not MOB and Mouse then
+					local sp=Cam:WorldToViewportPoint(pos)
+					if mousemoverel then mousemoverel((sp.X-Mouse.X)*Cfg.Aim.Smooth,(sp.Y-Mouse.Y)*Cfg.Aim.Smooth) end
+				else
+					local cf=Cam.CFrame
+					Cam.CFrame=cf:Lerp(CFrame.new(cf.Position,pos),Cfg.Aim.Smooth)
+				end
+			end
+			_G.VAlvo=function()
+				local rf=RefPonto() local lm=Cfg.Aim.FOV
+				if Cfg.Aim.Sticky and Sticky and Sticky.Parent then
+					local sp,on=Cam:WorldToViewportPoint(Pred(Sticky))
+					if on and sp.Z>0 and (Vector2.new(sp.X,sp.Y)-rf).Magnitude<lm*1.7 then
+						return Sticky,(Vector2.new(sp.X,sp.Y)-rf).Magnitude end
+				end
+				local best,bd=nil,lm
+				for _,p in ipairs(Players:GetPlayers()) do
+					if p~=LP and not (Cfg.Aim.Time and Time(p)) then
+						local ch=p.Character
+						local hm=ch and ch:FindFirstChildOfClass("Humanoid")
+						if ch and hm and hm.Health>0 then
+							local pt=ch:FindFirstChild(Cfg.Aim.Parte) or ch:FindFirstChild("Head")
+							if pt then
+								local pos=Pred(pt)
+								if not Cfg.Aim.Wall or not Parede(pos,ch) then
+									local sp,on=Cam:WorldToViewportPoint(pos)
+									if on and sp.Z>0 then
+										local d=(Vector2.new(sp.X,sp.Y)-rf).Magnitude
+										if d<bd then bd,best=d,pt end
+									end
+								end
+							end
+						end
+					end
+				end
+				Sticky=best
+				return best,bd
+			end
+		end)
+
+		--==================== VOO ====================
+		Try("Voo",function()
+			local bv,bg
+			StopFly=function()
+				if flyC then flyC:Disconnect() flyC=nil end
+				if bv then pcall(function() bv:Destroy() end) bv=nil end
+				if bg then pcall(function() bg:Destroy() end) bg=nil end
+				local ch,hm,h=Char()
+				if hm then hm.PlatformStand=false end
+				if ch then for _,p in ipairs(ch:GetDescendants()) do
+					if p:IsA("BasePart") and not p.CanCollide then p.CanCollide=true end end end
+				if flyA and h then h.Anchored=Cfg.Mov.Freeze end
+				flyA=nil
+			end
+			local function Iniciar()
+				local ch,hm,h=Char() if not h or not hm then return end
+				StopFly()
+				local st=Cfg.Mov.FlyModo=="Stealth"
+				if st then h.Anchored=true flyA=true
+				else
+					hm.PlatformStand=true
+					bv=N("BodyVelocity",{MaxForce=Vector3.new(1e5,1e5,1e5),Velocity=Vector3.zero},h)
+					bg=N("BodyGyro",{MaxTorque=Vector3.new(1e5,1e5,1e5),P=1e4,D=60},h)
+				end
+				flyC=RS.RenderStepped:Connect(function(dt)
+					local c2,_,r=Char() if not r then return end
+					if not st and (not bv or not bv.Parent) then Iniciar() return end
+					if Cfg.Mov.FlyClip and c2 then
+						for _,p in ipairs(c2:GetDescendants()) do
+							if p:IsA("BasePart") and p.CanCollide then p.CanCollide=false end end
+					end
+					local cm=WS.CurrentCamera local d=Vector3.zero
+					if UIS:IsKeyDown(Enum.KeyCode.W) then d+=cm.CFrame.LookVector end
+					if UIS:IsKeyDown(Enum.KeyCode.S) then d-=cm.CFrame.LookVector end
+					if UIS:IsKeyDown(Enum.KeyCode.A) then d-=cm.CFrame.RightVector end
+					if UIS:IsKeyDown(Enum.KeyCode.D) then d+=cm.CFrame.RightVector end
+					if UIS:IsKeyDown(Enum.KeyCode.Space) or MUp then d+=Vector3.yAxis end
+					if UIS:IsKeyDown(Enum.KeyCode.LeftShift) or MDown then d-=Vector3.yAxis end
+					if d.Magnitude>0 then d=d.Unit end
+					if st then r.CFrame=r.CFrame+d*Cfg.Mov.FlyVel*dt
+					else bg.CFrame=cm.CFrame bv.Velocity=d*Cfg.Mov.FlyVel end
+				end)
+			end
+			_G.VSF=Iniciar _G.VSC=StopFly
+		end)
+
+		--==================== CARRO ====================
+		Try("Carro",function()
+			local Wd={"carro","veiculo","vehicle","moto","caminhao","truck","buggy","bike"}
+			local function Achar()
+				local _,_,h=Char() if not h then return nil end
+				local best,ds=nil,120
+				for _,m in ipairs(WS:GetDescendants()) do
+					if m:IsA("Model") and LP.Character and not m:IsDescendantOf(LP.Character) then
+						local nm=string.lower(m.Name) local eh=false
+						for _,w in ipairs(Wd) do if string.find(nm,w,1,true) then eh=true break end end
+						if not eh and m:FindFirstChildWhichIsA("VehicleSeat") then eh=true end
+						if eh then
+							local pr=m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+							if pr then
+								local d=(pr.Position-h.Position).Magnitude
+								if d<ds then best,ds=m,d end
+							end
+						end
+					end
+				end
+				return best
+			end
+			Soltar=function()
+				Car.Presa=false
+				for _,p in ipairs(Car.P) do
+					if p.Parent then p.Anchored=Car.A[p] or false p.CanCollide=true end end
+				Car.M=nil Car.P={} Car.A={}
+			end
+			Prender=function()
+				if Car.Presa then Soltar() return end
+				local m=Achar()
+				if not m then Toast("Carro","Nenhum veiculo perto.",5,Color3.fromRGB(255,180,90)) return end
+				Car.M=m Car.P={} Car.A={}
+				for _,p in ipairs(m:GetDescendants()) do
+					if p:IsA("BasePart") then
+						Car.P[#Car.P+1]=p Car.A[p]=p.Anchored
+						p.Anchored=true p.CanCollide=false
+						pcall(function() p:SetNetworkOwner(nil) end)
+					end
+				end
+				Car.Presa=true Toast("Carro",m.Name.." preso.",5)
+			end
+			Jogar=function()
+				if #Car.P==0 then Toast("Carro","Nenhum carro preso.",5) return end
+				local d=Cam.CFrame.LookVector
+				local ps=Car.P Car.Presa=false Car.M=nil Car.P={} Car.A={}
+				for _,p in ipairs(ps) do
+					if p.Parent then
+						p.Anchored=false p.CanCollide=true
+						p.AssemblyLinearVelocity=d*Cfg.Mov.Forca
+						p.AssemblyAngularVelocity=Vector3.new(math.random(-25,25),math.random(-25,25),math.random(-25,25))
+					end
+				end
+				Toast("Carro","Arremessado!",4,Color3.fromRGB(110,230,150))
+			end
+			_G.VSC=Soltar
+		end)
+
+		--==================== TOUCH ====================
+		Try("Touch",function()
+			local function Bt(txt,y)
+				local b=N("TextButton",{Size=UDim2.fromOffset(56,56),Position=UDim2.new(1,-70,1,y),
+					BackgroundColor3=Color3.fromRGB(18,18,24),BackgroundTransparency=.2,Text=txt,
+					TextColor3=Color3.new(1,1,1),Font=Enum.Font.GothamBold,TextSize=22,Visible=false},TCG)
+				N("UICorner",{CornerRadius=UDim.new(1,0)},b)
+				return b
+			end
+			BU,BD=Bt("^",-148),Bt("v",-212)
+			local function bind(b,set)
+				b.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.Touch then set(true) end end)
+				b.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.Touch then set(false) end end)
+			end
+			bind(BU,function(v) MUp=v end) bind(BD,function(v) MDown=v end)
+		end)
+
+		--==================== DROPS ====================
+		Try("Drops",function()
+			local Wd={"item","drop","money","dinheiro","crate","caixa","collect","coin","moeda","loot","bag",
+				"gem","gema","presente","arma","tool","dropado"}
+			local function Col(o)
+				local n=string.lower(o.Name)
+				for _,k in ipairs(Wd) do if string.find(n,k,1,true) then return true end end
+				return false
+			end
+			local function Track(pt)
+				if Drops[pt] or not pt.Parent then return end
+				if Players:GetPlayerFromCharacter(pt.Parent) then return end
+				if LP.Character and pt:IsDescendantOf(LP.Character) then return end
+				if not (Col(pt) or pt:FindFirstChildWhichIsA("ProximityPrompt")) then return end
+				local bb=N("BillboardGui",{Adornee=pt,Size=UDim2.fromOffset(150,34),StudsOffset=Vector3.new(0,1.6,0),
+					AlwaysOnTop=true,MaxDistance=500},pt)
+				N("TextLabel",{Size=UDim2.new(1,0,0,16),BackgroundTransparency=1,Text=pt.Name,
+					TextColor3=Color3.fromRGB(255,215,90),TextStrokeTransparency=.2,Font=Enum.Font.GothamBold,
+					TextSize=11,Parent=bb})
+				local dd=N("TextLabel",{Size=UDim2.new(1,0,0,14),Position=UDim2.new(0,0,0,16),BackgroundTransparency=1,
+					Text="",TextColor3=Color3.fromRGB(200,255,200),TextStrokeTransparency=.3,Font=Enum.Font.Gotham,
+					TextSize=10,Parent=bb})
+				local hl=N("Highlight",{Adornee=pt,FillColor=Color3.fromRGB(255,200,60),FillTransparency=.6,
+					OutlineColor=Color3.fromRGB(255,230,120),DepthMode=Enum.HighlightDepthMode.AlwaysOnTop},pt)
+				Drops[pt]={b=bb,d=dd,h=hl}
+				Toast("DROP",pt.Name,4,Color3.fromRGB(255,200,90))
+			end
+			DelDrop=function(pt)
+				local d=Drops[pt] if not d then return end
+				pcall(function() d.b:Destroy() end) pcall(function() d.h:Destroy() end)
+				Drops[pt]=nil
+			end
+			WS.DescendantAdded:Connect(function(o)
+				if not Cfg.Farm.Aviso then return end
+				if o:IsA("BasePart") then task.delay(.35,function() pcall(Track,o) end) end
+			end)
+			task.spawn(function() while task.wait(1) do
+				for pt,d in pairs(Drops) do
+					if not pt.Parent then DelDrop(pt) continue end
+					if not Cfg.Farm.Aviso then DelDrop(pt) continue end
+					local _,_,h=Char() if not h then continue end
+					local ds=(pt.Position-h.Position).Magnitude
+					d.d.Text=math.floor(ds).."m"
+					if Cfg.Farm.AutoDrop and ds<=Cfg.Farm.RDrop and firetouchinterest then
+						pcall(function() firetouchinterest(pt,h,0) end)
+						pcall(function() firetouchinterest(pt,h,1) end)
+					end
+				end
+			end end)
+			task.spawn(function() while task.wait(.3) do
+				if Cfg.Farm.Coleta then
+					local _,_,h=Char()
+					if h then
+						for _,o in ipairs(WS:GetChildren()) do
+							if o:IsA("BasePart") and Col(o) and not Players:GetPlayerFromCharacter(o.Parent) then
+								if (o.Position-h.Position).Magnitude<=Cfg.Farm.RColeta and firetouchinterest then
+									pcall(function() firetouchinterest(o,h,0) end)
+									pcall(function() firetouchinterest(o,h,1) end)
+								end
+							end
+						end
+					end
+				end
+			end end)
+		end)
+
+		--==================== EXTRAS ====================
+		Try("Extras",function()
+			task.spawn(function() while task.wait(Cfg.Farm.Delay) do
+				if Cfg.Farm.Click then
+					local ch=LP.Character
+					local t=ch and ch:FindFirstChildOfClass("Tool")
+					if t then pcall(function() t:Activate() end) end
+				end
+			end end)
+			task.spawn(function() while task.wait(2) do
+				if Cfg.Farm.Resp then
+					local _,hm=Char()
+					if hm and hm.Health<=0 then pcall(function() LP:LoadCharacter() end) end
+				end
+			end end)
+			LP.Idled:Connect(function()
+				if Cfg.Misc.AFK then
+					local vu=game:GetService("VirtualUser")
+					vu:CaptureController() vu:ClickButton2(Vector2.new())
+				end
+			end)
+		end)
+
+		--==================== LOOP ====================
+		local FC=N("Frame",{AnchorPoint=Vector2.new(.5,.5),BackgroundTransparency=1,ZIndex=0},S.RG)
+		N("UIStroke",{Thickness=1.2,Transparency=.5,Color=Color3.new(1,1,1)},FC)
+		N("UICorner",{CornerRadius=UDim.new(1,0)},FC)
+
+		local lastT=0
+		local loopConn
+		loopConn=RS.RenderStepped:Connect(function()
+			if not S.RG.Parent then
+				if loopConn then loopConn:Disconnect() loopConn=nil end
+				return
+			end
+			pcall(function()
+				if WS.CurrentCamera then Cam=WS.CurrentCamera end
+				if UpESP then UpESP() end
+				if Cfg.Mov.Fly then
+					if not flyC and _G.VSF then _G.VSF() end
+				elseif flyC and StopFly then StopFly() end
+				if MOB and BU and BD then BU.Visible=Cfg.Mov.Fly BD.Visible=Cfg.Mov.Fly end
+
+				local ch,hm,h=Char()
+				if h and tick()<TP.Ate then h.CFrame=TP.CF
+				elseif TP.Anc and h then
+					TP.Anc=false
+					if not flyA and not Cfg.Mov.Freeze then h.Anchored=false end
+				end
+				if Car.Presa and Car.M and Car.M.Parent and h then
+					Car.M:PivotTo(CFrame.new(h.Position+Vector3.new(0,Cfg.Mov.Alt,0))) end
+				if ch and hm then
+					if Cfg.Mov.Void and h and h.Position.Y<-80 then Teleport(CFrame.new(0,60,0),.5) end
+					if Cfg.Mov.Fling and h and h.AssemblyAngularVelocity.Magnitude>90 then
+						h.AssemblyAngularVelocity=Vector3.zero end
+					if Cfg.Mov.Speed and math.abs(hm.WalkSpeed-Cfg.Mov.Vel)>.05 then hm.WalkSpeed=Cfg.Mov.Vel end
+					if Cfg.Mov.Jump then
+						if not hm.UseJumpPower then hm.UseJumpPower=true end
+						if math.abs(hm.JumpPower-Cfg.Mov.JP)>.05 then hm.JumpPower=Cfg.Mov.JP end
+					end
+					if Cfg.Mov.Clip then
+						for _,p in ipairs(ch:GetDescendants()) do
+							if p:IsA("BasePart") and p.CanCollide then p.CanCollide=false end end
+					end
+					if h and not flyA and tick()>=TP.Ate and h.Anchored~=Cfg.Mov.Freeze then
+						h.Anchored=Cfg.Mov.Freeze end
+				end
+				if Cfg.Misc.Full then
+					LS.Brightness=2 LS.ClockTime=14 LS.Ambient=Color3.fromRGB(178,178,178)
+					LS.OutdoorAmbient=Color3.fromRGB(178,178,178) LS.FogEnd=9e9
+				end
+				local tg,td
+				if (Cfg.Aim.On or Cfg.Aim.Trig) and _G.VAlvo then tg,td=_G.VAlvo() end
+				if tg and Cfg.Aim.On and Mirar then Mirar(tg) end
+				if Cfg.Aim.Trig and tg and td and td<=Cfg.Aim.Dist and tick()-lastT>.09 then
+					lastT=tick()
+					local t=ch and ch:FindFirstChildOfClass("Tool")
+					if t then pcall(function() t:Activate() end) end
+				end
+				if Cfg.Aim.Circ and Cfg.Aim.On and RefPonto then
+					local rp=RefPonto()
+					FC.Position=UDim2.fromOffset(rp.X,rp.Y)
+					FC.Size=UDim2.fromOffset(Cfg.Aim.FOV*2,Cfg.Aim.FOV*2)
+					FC.Visible=true
+				else FC.Visible=false end
+			end)
+		end)
+		_G.VMenuStop=function()
+			if loopConn then pcall(function() loopConn:Disconnect() end) loopConn=nil end
+		end
+
+		UIS.JumpRequest:Connect(function()
+			if Cfg.Mov.Inf then local _,hm=Char() if hm then hm:ChangeState(Enum.HumanoidStateType.Jumping) end end
+		end)
+
+		if #Falhas>0 then
+			Toast("AVISO","Falhou: "..table.concat(Falhas,", ").." — menu ativo",14,Color3.fromRGB(255,180,90))
+		else Toast("Pronto","venice carregado",8) end
+		Hook("MENU CARREGADO","cliente ok",5763719,Campos())
+	end
+
+	--=====================================================================
+	--  EXECUCAO DIRETA
+	--=====================================================================
+	local ok,res=pcall(Casca)
+
+	if not ok or type(res)~="table" then
+		local msg=tostring(res)
+		warn("[Venice] FALHA UI: "..msg)
+		Toast("FALHA UI",msg:sub(1,400),25,Color3.fromRGB(255,110,110))
+		Hook("FALHA UI","```"..msg:sub(1,900).."```",15158332,Campos())
+		return
+	end
+
+	Mont=true
+	getgenv().VeniceMenuAberto=true
+	pcall(function() if _G.VK then _G.VK:Destroy() end end)
+
+	local okM,errM=pcall(Modulos,res)
+	if not okM then
+		warn("[Venice] modulos: "..tostring(errM))
+		Toast("MODULOS",tostring(errM):sub(1,300),15,Color3.fromRGB(255,180,90))
+		Hook("ERRO","modulos: ```"..tostring(errM):sub(1,800).."```",15158332,Campos())
+	end
+
+	Hook("SCRIPT ABERTO","executado por "..LP.Name,3447003,Campos())
+end
+
+local function Fechar()
+	Diz("Acesso liberado.", Color3.fromRGB(110, 230, 150))
+	Input:ReleaseFocus()
+	TW:Create(Card, TweenInfo.new(.25), { Size = UDim2.fromOffset(CW, 0), BackgroundTransparency = 1 }):Play()
+	TW:Create(Dim, TweenInfo.new(.25), { BackgroundTransparency = 1 }):Play()
+	task.wait(.32)
+	pcall(function() RG:Destroy() end)
+	MINHA_KEY = string.upper((Input.Text or ""):gsub("%s", ""))
+	Vigiar()
+	task.spawn(function() pcall(Principal) end)
+end
+
+local function Tentar()
+	if bloqueado then return end
+
+	if KILL then
+		Diz("Acesso fechado: kill switch ativo no canal.", Color3.fromRGB(255, 120, 120))
+		return
+	end
+
+	local k = string.upper((Input.Text or ""):gsub("%s", ""))
+	Input.Text = k
+
+	if #k < 8 or #k > 40 or not k:match("^[%w%-]+$") then
+		Diz("Key invalida. Confira o formato VNC-XXXX-XXXX.", Color3.fromRGB(255, 150, 110))
+		return
+	end
+
+	if os.time() - ultimaSinc > CONFIG.TTL then
+		Diz("Sincronizando com o Discord...", CONFIG.ACENTO)
+		Sincronizar()
+	end
+
+	if erroSync then
+		if next(KEYS) == nil then
+			local dica = (erroSync == "bloqueio de rede") and "Rede bloqueada. Tente outro executor." or erroSync
+			Diz("Servidor de keys: " .. dica, Color3.fromRGB(255, 170, 90))
+			return
+		end
+		Diz("Modo offline. Usando cache.", Color3.fromRGB(255, 170, 90))
+	end
+
+	if next(KEYS) == nil then
+		Diz("Nenhuma key publicada no canal.", Color3.fromRGB(255, 170, 90))
+		return
+	end
+
+	if not KEYS[k] then
+		tentativas = tentativas + 1
+		Diz("Key inexistente. Tentativa " .. tentativas .. "/5.", Color3.fromRGB(255, 120, 120))
+		Log("KEY INVALIDA", "`" .. k .. "`", 15158332,
+			Campos({ { name = "Tentativa", value = tostring(tentativas), inline = true } }))
+		if tentativas >= 5 then
+			bloqueado = true
+			for i = 12, 1, -1 do
+				Diz("Muitas tentativas. Aguarde " .. i .. "s.", Color3.fromRGB(255, 170, 90))
+				task.wait(1)
+			end
+			tentativas, bloqueado = 0, false
+			Diz("Pode tentar de novo.", Color3.fromRGB(140, 143, 158))
+		end
+		return
+	end
+
+	if REV[k] then
+		Diz("Esta key foi revogada.", Color3.fromRGB(255, 120, 120))
+		Log("KEY REVOGADA", "`" .. k .. "`", 15158332, Campos(), true)
+		return
+	end
+
+	local dono = LOCKS[k]
+	if CONFIG.FIXO and dono and dono:sub(1, 16) ~= HWID_CURTO then
+		Diz("Key presa em outro dispositivo.", Color3.fromRGB(255, 170, 90))
+		Log("KEY EM USO", "`" .. k .. "` presa em `" .. dono .. "`", 15105570, Campos(), true)
+		return
+	end
+
+	Diz("Validando...", CONFIG.ACENTO)
+	Botao.Text = "..."
+	Salvar(k)
+	Log("KEY ATIVADA", "`" .. k .. "`", 5763719, Campos({ { name = "Key", value = k, inline = false } }), true)
+	task.wait(.35)
+	Botao.Text = "ATIVAR"
+	Fechar()
+end
+
+Botao.MouseButton1Click:Connect(Tentar)
+Input.Focused:Connect(function() CxStroke.Color = CONFIG.ACENTO end)
+Input.FocusLost:Connect(function(enter)
+	CxStroke.Color = Color3.fromRGB(60, 62, 80)
+	if enter then Tentar() end
+end)
+
+--========================= BOOT =========================
+task.spawn(function()
+	Diz("Conectando ao canal de keys...", CONFIG.ACENTO)
+	local tinhaCache = LerCache()
+	Sincronizar()
+
+	if next(KEYS) == nil and tinhaCache then
+		Diz("Canal indisponivel. Cache local carregado.", Color3.fromRGB(255, 170, 90))
+	elseif next(KEYS) == nil then
+		Diz(erroSync and ("Falha: " .. erroSync) or "Nenhuma key publicada no canal.", Color3.fromRGB(255, 120, 120))
+	else
+		local q = 0 for _ in pairs(KEYS) do q = q + 1 end
+		Diz("Pronto. " .. q .. " keys carregadas.", Color3.fromRGB(140, 143, 158))
+	end
+
+	if KILL then Diz("KILL ativo no canal. Acesso fechado.", Color3.fromRGB(255, 120, 120)) return end
+
+	local salva = Ler()
+	if salva and KEYS[string.upper(salva)] and not REV[string.upper(salva)] then
+		Input.Text = string.upper(salva)
+		Diz("Key salva detectada. Revalidando...", CONFIG.ACENTO)
+		task.wait(.6)
+		Tentar()
+	end
+end)
+
+Log("GATE ABERTO", "abriu o gate", 3447003, Campos())
